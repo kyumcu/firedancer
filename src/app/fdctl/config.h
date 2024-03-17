@@ -120,6 +120,7 @@ typedef struct {
     uint quic_tile_count;
     uint verify_tile_count;
     uint bank_tile_count;
+    uint shred_tile_count;
   } layout;
 
   struct {

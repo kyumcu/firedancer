@@ -124,6 +124,12 @@ typedef struct {
   fd_fec_resolver_t  * resolver;
   fd_pubkey_t          identity_key[1]; /* Just the public key */
 
+  ulong                round_robin_id;
+  ulong                round_robin_cnt;
+  /* Determines which shred tile is handling microblocks from PoH */
+  ulong                shredding;
+  ulong                shredded;
+
   fd_keyguard_client_t keyguard_client[1];
 
   uint                 src_ip_addr;
@@ -285,7 +291,6 @@ during_frag( void * _ctx,
              ulong  sz,
              int *  opt_filter ) {
   (void)seq;
-  (void)opt_filter;
 
   fd_shred_ctx_t * ctx = (fd_shred_ctx_t *)_ctx;
 
@@ -351,34 +356,43 @@ during_frag( void * _ctx,
       ctx->pending_batch.slot           = 0UL;
       ctx->pending_batch.pos            = 0UL;
       ctx->pending_batch.microblock_cnt = 0UL;
+      ctx->shredding                    = 0UL;
+      ctx->shredded                     = 0UL;
     }
 
     ctx->pending_batch.slot = target_slot;
-    /* Ugh, yet another memcpy */
-    fd_memcpy( ctx->pending_batch.payload + ctx->pending_batch.pos, entry, entry_sz );
+    if( FD_UNLIKELY( ctx->shredding==ctx->round_robin_id ) ) {
+      /* Ugh, yet another memcpy */
+      fd_memcpy( ctx->pending_batch.payload + ctx->pending_batch.pos, entry, entry_sz );
+    }
     ctx->pending_batch.pos += entry_sz;
     ctx->pending_batch.microblock_cnt++;
 
     int last_in_batch = entry_meta->block_complete | (ctx->pending_batch.pos > PENDING_BATCH_WMARK);
 
+    ctx->send_fec_set_idx = ULONG_MAX;
     if( FD_UNLIKELY( last_in_batch )) {
-      fd_shredder_init_batch( ctx->shredder, ctx->pending_batch.raw, sizeof(ulong)+ctx->pending_batch.pos, target_slot, entry_meta );
+      if( FD_UNLIKELY( ctx->shredding==ctx->round_robin_id ) ) {
+        FD_LOG_NOTICE(( "POH During Frag Shred Tile: %lu", ctx->round_robin_id ));
+        fd_shredder_init_batch( ctx->shredder, ctx->pending_batch.raw, sizeof(ulong)+ctx->pending_batch.pos, target_slot, entry_meta );
 
-      /* We sized this so it fits in one FEC set */
-      FD_TEST( fd_shredder_next_fec_set( ctx->shredder, out ) );
-      fd_shredder_fini_batch( ctx->shredder );
+        /* We sized this so it fits in one FEC set */
+        FD_TEST( fd_shredder_next_fec_set( ctx->shredder, out ) );
+        fd_shredder_fini_batch( ctx->shredder );
 
-      d_rcvd_join( d_rcvd_new( d_rcvd_delete( d_rcvd_leave( out->data_shred_rcvd   ) ) ) );
-      p_rcvd_join( p_rcvd_new( p_rcvd_delete( p_rcvd_leave( out->parity_shred_rcvd ) ) ) );
+        d_rcvd_join( d_rcvd_new( d_rcvd_delete( d_rcvd_leave( out->data_shred_rcvd   ) ) ) );
+        p_rcvd_join( p_rcvd_new( p_rcvd_delete( p_rcvd_leave( out->parity_shred_rcvd ) ) ) );
 
-      ctx->send_fec_set_idx = ctx->shredder_fec_set_idx;
+        ctx->send_fec_set_idx = ctx->shredder_fec_set_idx;
+        ctx->shredded         = 1UL;
+      }
 
-      /* reset state */
+      /* reset state for all shred tiles */
       ctx->pending_batch.slot           = 0UL;
       ctx->pending_batch.pos            = 0UL;
       ctx->pending_batch.microblock_cnt = 0UL;
-    } else {
-      ctx->send_fec_set_idx = ULONG_MAX;
+      /* let someone else do the shredding from PoH */
+      ctx->shredding                    = ( ctx->shredding+1 )%ctx->round_robin_cnt;
     }
   } else { /* the common case, from the netmux tile */
     /* The FEC resolver API does not present a prepare/commit model. If we
@@ -392,6 +406,19 @@ during_frag( void * _ctx,
     uchar const * dcache_entry = fd_chunk_to_laddr_const( ctx->net_in_mem, chunk );
     ulong hdr_sz = fd_disco_netmux_sig_hdr_sz( sig );
     FD_TEST( hdr_sz < sz ); /* Should be ensured by the net tile */
+    fd_shred_t const * shred = fd_shred_parse( dcache_entry+hdr_sz, sz-hdr_sz );
+    if( FD_UNLIKELY( !shred ) ) {
+      *opt_filter = 1;
+      return;
+    };
+    /* the second last digit is fairly random */
+    ulong sig = ( ulong )( shred->signature )/10UL;
+    /* all shreds in the same FEC set will have the same signature
+       so we can parallelize handling them */
+    if( FD_UNLIKELY( sig%ctx->round_robin_cnt!=ctx->round_robin_id ) ) {
+      *opt_filter = 1;
+      return;
+    }
     fd_memcpy( ctx->shred_buffer, dcache_entry+hdr_sz, sz-hdr_sz );
     ctx->shred_buffer_sz = sz-hdr_sz;
   }
@@ -526,14 +553,17 @@ after_frag( void *             _ctx,
   s34[ 3 ].shred_cnt = set->parity_shred_cnt - fd_ulong_min( set->parity_shred_cnt, 34UL );
 
   /* Send to the blockstore, skipping any empty shred34_t s. */
-  ulong sig = 0UL;
-  ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
-  fd_mux_publish( mux, sig, fd_laddr_to_chunk( ctx->store_out_mem, s34+0UL ), sizeof(fd_shred34_t), 0UL, ctx->tsorig, tspub );
-  if( FD_UNLIKELY( s34[ 1 ].shred_cnt ) )
-    fd_mux_publish( mux, sig, fd_laddr_to_chunk( ctx->store_out_mem, s34+1UL ), sizeof(fd_shred34_t), 0UL, ctx->tsorig, tspub );
-  fd_mux_publish( mux, sig, fd_laddr_to_chunk( ctx->store_out_mem, s34+2UL), sizeof(fd_shred34_t), 0UL, ctx->tsorig, tspub );
-  if( FD_UNLIKELY( s34[ 3 ].shred_cnt ) )
-    fd_mux_publish( mux, sig, fd_laddr_to_chunk( ctx->store_out_mem, s34+3UL ), sizeof(fd_shred34_t), 0UL, ctx->tsorig, tspub );
+  if( FD_UNLIKELY( ( ctx->shredded || in_idx==NET_IN_IDX ) ) ) {
+    ulong sig = 0UL;
+    ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
+    fd_mux_publish( mux, sig, fd_laddr_to_chunk( ctx->store_out_mem, s34+0UL ), sizeof(fd_shred34_t), 0UL, ctx->tsorig, tspub );
+    if( FD_UNLIKELY( s34[ 1 ].shred_cnt ) )
+      fd_mux_publish( mux, sig, fd_laddr_to_chunk( ctx->store_out_mem, s34+1UL ), sizeof(fd_shred34_t), 0UL, ctx->tsorig, tspub );
+    fd_mux_publish( mux, sig, fd_laddr_to_chunk( ctx->store_out_mem, s34+2UL), sizeof(fd_shred34_t), 0UL, ctx->tsorig, tspub );
+    if( FD_UNLIKELY( s34[ 3 ].shred_cnt ) )
+      fd_mux_publish( mux, sig, fd_laddr_to_chunk( ctx->store_out_mem, s34+3UL ), sizeof(fd_shred34_t), 0UL, ctx->tsorig, tspub );
+    if( FD_UNLIKELY( in_idx!=NET_IN_IDX ) ) ctx->shredded = 0UL;
+  }
 
   /* Compute all the destinations for all the new shreds */
 
@@ -642,6 +672,11 @@ unprivileged_init( fd_topo_t *      topo,
 
   FD_SCRATCH_ALLOC_INIT( l, scratch );
   fd_shred_ctx_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof( fd_shred_ctx_t ), sizeof( fd_shred_ctx_t ) );
+
+  ctx->round_robin_cnt = fd_topo_tile_name_cnt( topo, tile->name );
+  ctx->round_robin_id  = tile->kind_id;
+  ctx->shredding       = 0UL;
+  ctx->shredded        = 0UL;
 
   ulong fec_resolver_footprint = fd_fec_resolver_footprint( tile->shred.fec_resolver_depth, 1UL, shred_store_mcache_depth,
                                                             128UL * tile->shred.fec_resolver_depth );
